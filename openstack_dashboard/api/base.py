@@ -388,4 +388,6 @@ def get_request_page_size(request, limit=None):
         return request.session.get('horizon_pagesize', default_page_size)
 
 def is_stx_region(request):
-    return is_service_enabled(request, 'platform')
+    if not base.is_service_enabled(request, 'platform'):
+        return False
+    return True

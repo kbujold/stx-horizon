@@ -15,6 +15,9 @@
 /* Namespace for core functionality related to DataTables. */
 horizon.datatables = {
   update: function () {
+    // WRS: Performance optimization - disable row refresh to reduce
+    // platform load since we already have periodic page refresh.
+    return;
     if (horizon.datatables.timeout) {
       clearTimeout(horizon.datatables.timeout);
       horizon.datatables.timeout = false;
@@ -31,7 +34,7 @@ horizon.datatables = {
     // Do not update this row if the action column is expanded
     if ($rows_to_update.find('.actions_column .btn-group.open').length) {
       // Wait and try to update again in next interval instead
-        horizon.datatables.timeout = false;
+        horizon.datatables.timeout = setTimeout(horizon.datatables.update, interval);
       // Remove interval decay, since this will not hit server
       $table.removeAttr('decay_constant');
       return;
@@ -40,11 +43,29 @@ horizon.datatables = {
     $rows_to_update.each(function() {
       var $row = $(this);
       var $table = $row.closest('table.datatable');
-            // Performance optimization - disable row refresh to reduce
-            // platform load since we already have periodic page refresh.
-            // This row update is now used solely to do an immediate rendering
-            // of progress bars
-            var $new_row = $row;
+
+      requests.push(
+        horizon.ajax.queue({
+          url: $row.attr('data-update-url'),
+          error: function (jqXHR) {
+            switch (jqXHR.status) {
+              // A 404 indicates the object is gone, and should be removed from the table
+              case 404:
+                horizon.datatables.remove_row($table, $row);
+                // Reset tablesorter's data cache.
+                $table.trigger("update");
+                // Enable launch action if quota is not exceeded
+                horizon.datatables.update_actions();
+                break;
+              default:
+                console.log(gettext("An error occurred while updating."));
+                $row.removeClass("ajax-update");
+                $row.find("i.ajax-updating").remove();
+                break;
+            }
+          },
+          success: function (data) {
+            var $new_row = $(data);
 
             if ($new_row.hasClass('warning')) {
               var $container = $(document.createElement('div'))
@@ -71,6 +92,51 @@ horizon.datatables = {
               }
               $new_row.find("td.warning:last").prepend($container);
             }
+
+            // CGCS: compare the rows without the checkbox row since it has
+            // new UUIDs everytime (can't compare just text since classes are important)
+            $row_cmp = $row.clone();
+            $row_cmp.find('.themable-checkbox').remove();
+            $new_row_cmp = $new_row.clone();
+            $new_row_cmp.find('.themable-checkbox').remove();
+
+            // Only replace row if the html content has changed
+            if($new_row_cmp.html() !== $row_cmp.html()) {
+              horizon.datatables.replace_row($row, $new_row);
+
+              // TODO(matt-borland, tsufiev): ideally we should solve the
+              // problem with not-working angular actions in a content added
+              // by jQuery via replacing jQuery insert with Angular insert.
+              // Should address this in Newton release
+              recompileAngularContent($table);
+
+              // Reset tablesorter's data cache.
+              $table.trigger("update");
+              // Reset decay constant.
+              $table.removeAttr('decay_constant');
+              // Check that quicksearch is enabled for this table
+              // Reset quicksearch's data cache.
+              if ($table.attr('id') in horizon.datatables.qs) {
+                horizon.datatables.qs[$table.attr('id')].cache();
+              }
+            }
+          },
+          complete: function () {
+            // Revalidate the button check for the updated table
+            horizon.datatables.validate_button();
+          }
+        })
+      );
+    });
+
+    $.when.apply($, requests).always(function() {
+      decay_constant = decay_constant || 0;
+      decay_constant++;
+      $table.attr('decay_constant', decay_constant);
+      var next_poll = interval * decay_constant;
+      // Limit the interval to 30 secs
+      if(next_poll > 30 * 1000) { next_poll = 30 * 1000; }
+      horizon.datatables.timeout = setTimeout(horizon.datatables.update, next_poll);
     });
   },
 
@@ -943,8 +1009,8 @@ horizon.datatables.refresh = function (html) {
             var $old_row = $old_table.find('tr#' + $new_row.attr('id').replace(/[!"#$%&'()*+,.\/:;<=>?@[\\\]^`{|}~]/g, "\\$&"));
 
             if ($old_row.length) {
-                // Only replace row if the html content has changed, or it is in the warning state
-                if($new_row.text() != $old_row.text() || $new_row.hasClass('warning')) {
+                // Only replace row if the html content has changed
+                if($new_row.text() != $old_row.text()) {
                     horizon.datatables.replace_row($old_row, $new_row);
                     changed = true;
                     row_changed = true;
@@ -1014,6 +1080,7 @@ horizon.datatables.refresh = function (html) {
 
             // Reset tablesorter's data cache.
             $old_table.trigger("update");
+            horizon.datatables.update();
             horizon.datatables.fix_row_striping($old_table);
 
             // Reset quicksearch filter cache.
